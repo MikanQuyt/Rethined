@@ -1,4 +1,9 @@
+# I used Colab for training
 import os
+import glob
+import math
+import cv2
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -6,12 +11,11 @@ import torchvision
 from torchvision.utils import save_image
 import torchvision.transforms as T
 from einops import rearrange
-import math
-import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 from kornia.filters import GaussianBlur2d
 from mobileone import MobileOne, mobileone
+import random
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, d_v, n_head, split, dropout, d_qk, compute_v, use_argmax=False):
@@ -267,8 +271,15 @@ if __name__ == '__main__':
     model = InpaintingModel(config).to(device)
     attention_upscaler = AttentionUpscaling(model.generator).to(device)
 
-    if os.path.exists("/content/rethined_weights_best.pth"):
-        state_dict = torch.load("/content/rethined_weights_best.pth", map_location=device)
+    checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint.pth"
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+            
         new_state_dict = {}
         for k, v in state_dict.items():
             name = k.replace("_orig_mod.", "")
@@ -278,7 +289,17 @@ if __name__ == '__main__':
     model.eval()
     attention_upscaler.eval()
 
-    IMAGE_PATH = "/content/rethined/datasets/SuperCAF/images/0001_obj_1782_2708_0.1007724338107639.jpg"
+    image_dir = "/content/rethined/datasets/SuperCAF/images"
+    all_images = []
+    for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
+        all_images.extend(glob.glob(os.path.join(image_dir, ext)))
+
+    if len(all_images) == 0:
+        raise RuntimeError(f"No images found in the directory: {image_dir}")
+    
+    IMAGE_PATH = random.choice(all_images)
+    print(f"Evaluating random image: {IMAGE_PATH}")
+    
     try:
         raw_image = Image.open(IMAGE_PATH).convert("RGB")
         transform = T.Compose([
@@ -305,7 +326,7 @@ if __name__ == '__main__':
 
         final_output = final_output * high_res_mask + high_res_image * (1 - high_res_mask)
 
-    save_image(final_output, "ket_qua.png", normalize=True)
+    save_image(final_output, "result.png", normalize=True)
 
     def tensor_to_img(tensor):
         img = tensor.squeeze(0).detach().cpu().permute(1, 2, 0).numpy()
@@ -318,15 +339,15 @@ if __name__ == '__main__':
     fig, axes = plt.subplots(1, 3, figsize=(20, 8))
 
     axes[0].imshow(img_original)
-    axes[0].set_title("Ảnh gốc", fontsize=16)
+    axes[0].set_title("Original Image", fontsize=16)
     axes[0].axis('off')
 
     axes[1].imshow(img_masked)
-    axes[1].set_title("Ảnh bị hỏng", fontsize=16)
+    axes[1].set_title("Damaged Image", fontsize=16)
     axes[1].axis('off')
 
     axes[2].imshow(img_final)
-    axes[2].set_title("Ảnh phục hồi", fontsize=16)
+    axes[2].set_title("Restored Image", fontsize=16)
     axes[2].axis('off')
 
     plt.tight_layout()
