@@ -1,4 +1,5 @@
-# I used Colab for training
+#Using colab
+
 import os
 import glob
 import math
@@ -258,12 +259,19 @@ class VGGPerceptualLoss(torch.nn.Module):
         return loss
 
 class HighResInpaintingDataset(Dataset):
-    def __init__(self, image_dir, size=1024):
+    def __init__(self, image_dirs, size=1024):
         self.image_paths = []
-        for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
-            self.image_paths.extend(glob.glob(os.path.join(image_dir, ext)))
+        
+        if isinstance(image_dirs, str):
+            image_dirs = [image_dirs]
+            
+        for img_dir in image_dirs:
+            for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
+                self.image_paths.extend(glob.glob(os.path.join(img_dir, ext)))
+                
         if len(self.image_paths) == 0:
-            raise RuntimeError(f"Error: Directory is empty or does not exist -> {image_dir}")
+            raise RuntimeError(f"Error: Directory is empty or does not exist -> {image_dirs}")
+            
         self.size = size
         self.transform = T.Compose([
             T.Resize((size, size)),
@@ -290,12 +298,18 @@ class HighResInpaintingDataset(Dataset):
         return img, mask
 
 def train_weights():
-    TOTAL_EPOCHS = 600
+    TOTAL_EPOCHS = 800
     accumulation_steps = 4
     START_EPOCH = 0
-    checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint.pth"
+    checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint/rethined_checkpoint.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = HighResInpaintingDataset("/content/rethined/datasets/SuperCAF/images")
+    
+    image_dirs = [
+        "/content/rethined/datasets/DF8K-Inpainting/masks/test/cafhq/",
+        "/content/rethined/datasets/DF8K-Inpainting/masks/test/div2k/"
+    ]
+    
+    dataset = HighResInpaintingDataset(image_dirs)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=2, pin_memory=True, prefetch_factor=2)
 
     config = {
@@ -351,7 +365,7 @@ def train_weights():
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print(f"Successfully restored 100% of parameters from Epoch {START_EPOCH}.")
         except Exception as e:
-            print(f"Warning: Could not load optimizer ({e}). Reinitializing.")
+            print(f"Warning: Could not load optimiser ({e}). Reinitialising.")
 
     l1_loss_fn = torch.nn.L1Loss()
     perceptual_loss_fn = VGGPerceptualLoss().to(device)
@@ -369,20 +383,20 @@ def train_weights():
     model.train()
     if is_resuming:
         model.coarse_model.eval()
-    
+
     best_loss = float('inf')
-    best_checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint_best.pth"
+    best_checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint/rethined_checkpoint_best.pth"
 
     if is_resuming and os.path.exists(checkpoint_path):
-      if 'best_loss' in checkpoint:
-        best_loss = checkpoint['best_loss']
-        print(f"Previous Best Loss: {best_loss:.4f}")
+        if 'best_loss' in checkpoint:
+            best_loss = checkpoint['best_loss']
+            print(f"Best Loss: {best_loss:.4f}")
 
     for epoch in range(START_EPOCH, TOTAL_EPOCHS):
         epoch_loss = 0.0
         progress_bar = tqdm(enumerate(dataloader),
                             total=len(dataloader),
-                            desc=f"Epoch {epoch+1}/{TOTAL_EPOCHS}")
+                            desc=f"Epoch {epoch}/{TOTAL_EPOCHS}")
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -427,7 +441,7 @@ def train_weights():
             progress_bar.set_postfix({'loss': f"{display_loss:.4f}", 'lr': f"{current_display_lr:.6f}"})
 
         avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch {epoch+1}/{TOTAL_EPOCHS} completed - Average Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch}/{TOTAL_EPOCHS} completed - Average Loss: {avg_loss:.4f}")
 
         checkpoint_data = {
             'epoch': epoch,
@@ -436,13 +450,13 @@ def train_weights():
             'best_loss': best_loss
         }
         torch.save(checkpoint_data, checkpoint_path)
-        print(f"Successfully saved Checkpoint (Epoch {epoch+1}) to Google Drive.")
+        print(f"Successfully saved checkpoint (Epoch {epoch}) to Google Drive.")
 
         if avg_loss < best_loss:
-          print(f"New Record! Loss decreased from {best_loss:.4f} down to {avg_loss:.4f}")
-          best_loss = avg_loss
-          torch.save(model.state_dict(), best_checkpoint_path)
-          print(f"Updated file rethined_checkpoint_best.pth")
+            print(f"New Record! Loss decreased from {best_loss:.4f} down to {avg_loss:.4f}")
+            best_loss = avg_loss
+            torch.save(model.state_dict(), best_checkpoint_path)
+            print("Updated file rethined_checkpoint_best.pth")
 
 if __name__ == "__main__":
     train_weights()
