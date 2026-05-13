@@ -1,5 +1,4 @@
 #Using colab
-
 import os
 import glob
 import math
@@ -261,17 +260,17 @@ class VGGPerceptualLoss(torch.nn.Module):
 class HighResInpaintingDataset(Dataset):
     def __init__(self, image_dirs, size=1024):
         self.image_paths = []
-        
+
         if isinstance(image_dirs, str):
             image_dirs = [image_dirs]
-            
+
         for img_dir in image_dirs:
             for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
                 self.image_paths.extend(glob.glob(os.path.join(img_dir, ext)))
-                
+
         if len(self.image_paths) == 0:
             raise RuntimeError(f"Error: Directory is empty or does not exist -> {image_dirs}")
-            
+
         self.size = size
         self.transform = T.Compose([
             T.Resize((size, size)),
@@ -303,12 +302,12 @@ def train_weights():
     START_EPOCH = 0
     checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint/rethined_checkpoint.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     image_dirs = [
         "/content/rethined/datasets/DF8K-Inpainting/masks/test/cafhq/",
         "/content/rethined/datasets/DF8K-Inpainting/masks/test/div2k/"
     ]
-    
+
     dataset = HighResInpaintingDataset(image_dirs)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=2, pin_memory=True, prefetch_factor=2)
 
