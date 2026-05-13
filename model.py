@@ -234,6 +234,65 @@ class InpaintingModel(nn.Module):
     def forward(self, image, mask):
         return self.generator(image, mask)
 
+class VGGPerceptualLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
+        self.blocks = torch.nn.ModuleList([
+            vgg[:4], vgg[4:9], vgg[9:16], vgg[16:23]
+        ]).eval()
+        for param in self.blocks.parameters():
+            param.requires_grad = False
+
+    def forward(self, x, y):
+        loss = 0.0
+        x = (x - 0.5) / 0.5
+        y = (y - 0.5) / 0.5
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            loss += torch.nn.functional.l1_loss(x, y)
+        return loss
+
+class HighResInpaintingDataset(Dataset):
+    def __init__(self, image_dirs, size=1024):
+        self.image_paths = []
+        
+        if isinstance(image_dirs, str):
+            image_dirs = [image_dirs]
+            
+        for img_dir in image_dirs:
+            for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
+                self.image_paths.extend(glob.glob(os.path.join(img_dir, ext)))
+                
+        if len(self.image_paths) == 0:
+            raise RuntimeError(f"Error: Directory is empty or does not exist -> {image_dirs}")
+            
+        self.size = size
+        self.transform = T.Compose([
+            T.Resize((size, size)),
+            T.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def random_free_form_mask(self):
+        mask = np.zeros((self.size, self.size), np.float32)
+        num_strokes = np.random.randint(3, 10)
+        for _ in range(num_strokes):
+            start_x, start_y = np.random.randint(0, self.size, 2)
+            end_x, end_y = np.random.randint(0, self.size, 2)
+            thickness = np.random.randint(20, 100)
+            cv2.line(mask, (start_x, start_y), (end_x, end_y), 1.0, thickness)
+        return torch.from_numpy(mask).unsqueeze(0)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        img = self.transform(img)
+        mask = self.random_free_form_mask()
+        return img, mask
+
 if __name__ == '__main__':
     config = {
         'coarse_model': {
@@ -271,7 +330,7 @@ if __name__ == '__main__':
     model = InpaintingModel(config).to(device)
     attention_upscaler = AttentionUpscaling(model.generator).to(device)
 
-    checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint.pth"
+    checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint/rethined_checkpoint.pth"
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
         
@@ -289,13 +348,18 @@ if __name__ == '__main__':
     model.eval()
     attention_upscaler.eval()
 
-    image_dir = "/content/rethined/datasets/SuperCAF/images"
+    image_dirs = [
+        "/content/rethined/datasets/DF8K-Inpainting/masks/test/cafhq/",
+        "/content/rethined/datasets/DF8K-Inpainting/masks/test/div2k/"
+    ]
+    
     all_images = []
-    for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
-        all_images.extend(glob.glob(os.path.join(image_dir, ext)))
+    for img_dir in image_dirs:
+        for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
+            all_images.extend(glob.glob(os.path.join(img_dir, ext)))
 
     if len(all_images) == 0:
-        raise RuntimeError(f"No images found in the directory: {image_dir}")
+        raise RuntimeError(f"No images found in the directories: {image_dirs}")
     
     IMAGE_PATH = random.choice(all_images)
     print(f"Evaluating random image: {IMAGE_PATH}")
