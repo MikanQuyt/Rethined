@@ -325,18 +325,18 @@ def train_weights():
         new_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         model.load_state_dict(new_state_dict)
 
-        START_EPOCH = checkpoint['epoch'] + 1
+        START_EPOCH = checkpoint['epoch']
         is_resuming = True
-        print(f"Resuming training from Epoch {START_EPOCH}")
-
+        print(f"Resuming training from Epoch {START_EPOCH + 1}")
+        print(f"However, retraining Epoch {START_EPOCH} to gain momentum and ensure training parameters.")
     else:
         print("No previous data found. Starting training from scratch (Epoch 0).")
 
     for param in model.parameters():
         param.requires_grad = True
     model.train()
-    
-    current_lr = 1e-4 
+
+    current_lr = 1e-4
 
     torch._dynamo.config.suppress_errors = True
     try:
@@ -349,9 +349,9 @@ def train_weights():
     if is_resuming and os.path.exists(checkpoint_path):
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print("Successfully restored 100% of AdamW optimizer state.")
+            print(f"Successfully restored 100% of parameters from Epoch {START_EPOCH}.")
         except Exception as e:
-            print(f"Warning: Could not load optimizer ({e}). Reinitialising.")
+            print(f"Warning: Could not load optimizer ({e}). Reinitializing.")
 
     l1_loss_fn = torch.nn.L1Loss()
     perceptual_loss_fn = VGGPerceptualLoss().to(device)
@@ -359,7 +359,7 @@ def train_weights():
 
     epochs_left = TOTAL_EPOCHS - START_EPOCH
     if epochs_left <= 0:
-        print("The model has completed the required number of epochs.")
+        print("Model has completed the required number of epochs.")
         return
 
     scheduler = CosineAnnealingLR(optimizer,
@@ -367,6 +367,16 @@ def train_weights():
                                   eta_min=1e-6)
 
     model.train()
+    if is_resuming:
+        model.coarse_model.eval()
+    
+    best_loss = float('inf')
+    best_checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint_best.pth"
+
+    if is_resuming and os.path.exists(checkpoint_path):
+      if 'best_loss' in checkpoint:
+        best_loss = checkpoint['best_loss']
+        print(f"Previous Best Loss: {best_loss:.4f}")
 
     for epoch in range(START_EPOCH, TOTAL_EPOCHS):
         epoch_loss = 0.0
@@ -422,10 +432,17 @@ def train_weights():
         checkpoint_data = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict()
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_loss': best_loss
         }
         torch.save(checkpoint_data, checkpoint_path)
-        print(f"Successfully saved checkpoint (Epoch {epoch+1}) to Google Drive.")
+        print(f"Successfully saved Checkpoint (Epoch {epoch+1}) to Google Drive.")
+
+        if avg_loss < best_loss:
+          print(f"New Record! Loss decreased from {best_loss:.4f} down to {avg_loss:.4f}")
+          best_loss = avg_loss
+          torch.save(model.state_dict(), best_checkpoint_path)
+          print(f"Updated file rethined_checkpoint_best.pth")
 
 if __name__ == "__main__":
     train_weights()
