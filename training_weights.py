@@ -1,4 +1,3 @@
-#Using colab
 import os
 import glob
 import math
@@ -297,10 +296,13 @@ class HighResInpaintingDataset(Dataset):
         return img, mask
 
 def train_weights():
-    TOTAL_EPOCHS = 800
+    TOTAL_EPOCHS = 1000
     accumulation_steps = 4
     START_EPOCH = 0
-    checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint/rethined_checkpoint.pth"
+
+    checkpoint_path = "/content/rethined_checkpoint.pth"
+    best_checkpoint_path = "/content/rethined_checkpoint_best.pth"
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     image_dirs = [
@@ -331,7 +333,7 @@ def train_weights():
     is_resuming = False
 
     if os.path.exists(checkpoint_path):
-        print("Found complete checkpoint. Restoring automatically...")
+        print("Found complete checkpoint locally. Restoring automatically.")
         checkpoint = torch.load(checkpoint_path, map_location=device)
 
         state_dict = checkpoint['model_state_dict']
@@ -341,9 +343,9 @@ def train_weights():
         START_EPOCH = checkpoint['epoch']
         is_resuming = True
         print(f"Resuming training from Epoch {START_EPOCH + 1}")
-        print(f"However, retraining Epoch {START_EPOCH} to gain momentum and ensure training parameters.")
+        print(f"Retraining Epoch {START_EPOCH} to gain momentum and ensure training parameters.")
     else:
-        print("No previous data found. Starting training from scratch (Epoch 0).")
+        print("No previous data found locally. Starting training from scratch (Epoch 0).")
 
     for param in model.parameters():
         param.requires_grad = True
@@ -362,7 +364,7 @@ def train_weights():
     if is_resuming and os.path.exists(checkpoint_path):
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"Successfully restored 100% of parameters from Epoch {START_EPOCH}.")
+            print(f"Successfully restored 100 percent of parameters from Epoch {START_EPOCH}.")
         except Exception as e:
             print(f"Warning: Could not load optimiser ({e}). Reinitialising.")
 
@@ -384,12 +386,11 @@ def train_weights():
         model.coarse_model.eval()
 
     best_loss = float('inf')
-    best_checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint/rethined_checkpoint_best.pth"
 
     if is_resuming and os.path.exists(checkpoint_path):
         if 'best_loss' in checkpoint:
             best_loss = checkpoint['best_loss']
-            print(f"Best Loss: {best_loss:.4f}")
+            print(f"Previous Best Loss: {best_loss:.4f}")
 
     for epoch in range(START_EPOCH, TOTAL_EPOCHS):
         epoch_loss = 0.0
@@ -446,16 +447,25 @@ def train_weights():
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
             'best_loss': best_loss
         }
-        torch.save(checkpoint_data, checkpoint_path)
-        print(f"Successfully saved checkpoint (Epoch {epoch}) to Google Drive.")
+
+        temp_path = checkpoint_path + ".tmp"
+        torch.save(checkpoint_data, temp_path)
+        os.replace(temp_path, checkpoint_path)
+        print(f"Successfully saved checkpoint (Epoch {epoch}) locally.")
 
         if avg_loss < best_loss:
             print(f"New Record! Loss decreased from {best_loss:.4f} down to {avg_loss:.4f}")
             best_loss = avg_loss
-            torch.save(model.state_dict(), best_checkpoint_path)
-            print("Updated file rethined_checkpoint_best.pth")
+
+            temp_best_path = best_checkpoint_path + ".tmp"
+            torch.save(model.state_dict(), temp_best_path)
+            os.replace(temp_best_path, best_checkpoint_path)
+
+            print("Updated best checkpoint file locally.")
 
 if __name__ == "__main__":
     train_weights()
