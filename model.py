@@ -1,4 +1,3 @@
-# I used Colab for training
 import os
 import glob
 import math
@@ -234,66 +233,7 @@ class InpaintingModel(nn.Module):
     def forward(self, image, mask):
         return self.generator(image, mask)
 
-class VGGPerceptualLoss(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
-        self.blocks = torch.nn.ModuleList([
-            vgg[:4], vgg[4:9], vgg[9:16], vgg[16:23]
-        ]).eval()
-        for param in self.blocks.parameters():
-            param.requires_grad = False
-
-    def forward(self, x, y):
-        loss = 0.0
-        x = (x - 0.5) / 0.5
-        y = (y - 0.5) / 0.5
-        for block in self.blocks:
-            x = block(x)
-            y = block(y)
-            loss += torch.nn.functional.l1_loss(x, y)
-        return loss
-
-class HighResInpaintingDataset(Dataset):
-    def __init__(self, image_dirs, size=1024):
-        self.image_paths = []
-        
-        if isinstance(image_dirs, str):
-            image_dirs = [image_dirs]
-            
-        for img_dir in image_dirs:
-            for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
-                self.image_paths.extend(glob.glob(os.path.join(img_dir, ext)))
-                
-        if len(self.image_paths) == 0:
-            raise RuntimeError(f"Error: Directory is empty or does not exist -> {image_dirs}")
-            
-        self.size = size
-        self.transform = T.Compose([
-            T.Resize((size, size)),
-            T.ToTensor()
-        ])
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def random_free_form_mask(self):
-        mask = np.zeros((self.size, self.size), np.float32)
-        num_strokes = np.random.randint(3, 10)
-        for _ in range(num_strokes):
-            start_x, start_y = np.random.randint(0, self.size, 2)
-            end_x, end_y = np.random.randint(0, self.size, 2)
-            thickness = np.random.randint(20, 100)
-            cv2.line(mask, (start_x, start_y), (end_x, end_y), 1.0, thickness)
-        return torch.from_numpy(mask).unsqueeze(0)
-
-    def __getitem__(self, idx):
-        img = Image.open(self.image_paths[idx]).convert("RGB")
-        img = self.transform(img)
-        mask = self.random_free_form_mask()
-        return img, mask
-
-if __name__ == '__main__':
+def test_inference():
     config = {
         'coarse_model': {
             'class': 'MobileOneCoarse',
@@ -304,66 +244,59 @@ if __name__ == '__main__':
         'generator': {
             'generator_class': 'PatchInpainting',
             'params': {
-                'kernel_size': 8,
-                'nheads': 1,
-                'stem_out_stride': 1,
-                'stem_out_channels': 3,
-                'merge_mode': 'all',
-                'image_size': 512,
-                'embed_dim': 576,
-                'use_qpos': None,
-                'use_kpos': None,
-                'dropout': 0.1,
-                'feature_i': 2,
-                'concat_features': True,
-                'final_conv': True,
-                'feature_dim': 896,
-                'attention_type': 'MultiHeadAttention',
-                'compute_v': False,
-                'use_argmax': False
+                'kernel_size': 8, 'nheads': 1, 'stem_out_stride': 1, 'stem_out_channels': 3,
+                'merge_mode': 'all', 'image_size': 512, 'embed_dim': 576, 'use_qpos': None,
+                'use_kpos': None, 'dropout': 0.1, 'feature_i': 2, 'concat_features': True,
+                'final_conv': True, 'feature_dim': 896, 'attention_type': 'MultiHeadAttention',
+                'compute_v': False, 'use_argmax': False
             }
         }
     }
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
 
     model = InpaintingModel(config).to(device)
     attention_upscaler = AttentionUpscaling(model.generator).to(device)
 
-    checkpoint_path = "/content/drive/MyDrive/rethined_checkpoint/rethined_checkpoint.pth"
+    checkpoint_path = "/content/rethined_checkpoint.pth"
     if os.path.exists(checkpoint_path):
+        print(f"Loading weights from: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)
         
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
-            
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            name = k.replace("_orig_mod.", "")
-            new_state_dict[name] = v
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        new_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         model.load_state_dict(new_state_dict)
+    else:
+        print("WARNING: Checkpoint file not found. The model will run with randomised weights!")
 
     model.eval()
     attention_upscaler.eval()
 
     image_dirs = [
-        "/content/rethined/datasets/DF8K-Inpainting/masks/test/cafhq/",
-        "/content/rethined/datasets/DF8K-Inpainting/masks/test/div2k/"
+        "/content/rethined/datasets/DF8K-Inpainting/masks/test/div2k",
+        "/content/rethined/datasets/DF8K-Inpainting/masks/test/cafhq",
     ]
     
     all_images = []
+    print("Scanning for images in directories...")
     for img_dir in image_dirs:
+        if not os.path.exists(img_dir):
+            print(f"  -> Skipping: Directory does not exist '{img_dir}'")
+            continue
+            
         for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
-            all_images.extend(glob.glob(os.path.join(img_dir, ext)))
-
+            found_imgs = glob.glob(os.path.join(img_dir, ext))
+            all_images.extend(found_imgs)
+            
     if len(all_images) == 0:
-        raise RuntimeError(f"No images found in the directories: {image_dirs}")
-    
+        raise RuntimeError(f"Could not find any images in the provided directories: {image_dirs}")
+
+    print(f"Total test images available: {len(all_images)}")
+
     IMAGE_PATH = random.choice(all_images)
-    print(f"Evaluating random image: {IMAGE_PATH}")
-    
+    print(f"Randomly selected image: {IMAGE_PATH}")
+
     try:
         raw_image = Image.open(IMAGE_PATH).convert("RGB")
         transform = T.Compose([
@@ -371,19 +304,27 @@ if __name__ == '__main__':
             T.ToTensor()
         ])
         high_res_image = transform(raw_image).unsqueeze(0).to(device)
-    except FileNotFoundError:
+    except Exception as e:
+        print(f"Error reading image: {e}. Using randomised noise image as a substitute.")
         high_res_image = torch.randn(1, 3, 1024, 1024).to(device)
 
     _, _, h, w = high_res_image.shape
     high_res_mask = torch.zeros(1, 1, h, w).to(device)
-    center_y, center_x = h // 2, w // 2
-    high_res_mask[:, :, center_y-200:center_y+200, center_x-200:center_x+200] = 1
+    
+    center_y = h // 2 + random.randint(-100, 100)
+    center_x = w // 2 + random.randint(-100, 100)
+    mask_size = random.randint(150, 250)
+    
+    y1, y2 = max(0, center_y - mask_size), min(h, center_y + mask_size)
+    x1, x2 = max(0, center_x - mask_size), min(w, center_x + mask_size)
+    high_res_mask[:, :, y1:y2, x1:x2] = 1
 
     low_res_image = F.interpolate(high_res_image, size=512, mode='bicubic', antialias=True)
     low_res_mask = F.interpolate(high_res_mask, size=512)
     masked_low_res_image = low_res_image * (1 - low_res_mask)
     masked_high_res_image = high_res_image * (1 - high_res_mask)
 
+    print("Running restoration network...")
     with torch.no_grad():
         output, attn_scores, temp_image = model(masked_low_res_image, low_res_mask)
         final_output = attention_upscaler(high_res_image, output, attn_scores)
@@ -391,6 +332,7 @@ if __name__ == '__main__':
         final_output = final_output * high_res_mask + high_res_image * (1 - high_res_mask)
 
     save_image(final_output, "result.png", normalize=True)
+    print("Result saved to 'result.png'.")
 
     def tensor_to_img(tensor):
         img = tensor.squeeze(0).detach().cpu().permute(1, 2, 0).numpy()
@@ -416,3 +358,6 @@ if __name__ == '__main__':
 
     plt.tight_layout()
     plt.show()
+
+if __name__ == '__main__':
+    test_inference()
