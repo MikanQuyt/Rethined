@@ -1,3 +1,4 @@
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingLR, ReduceLROnPlateau
 import os
 import glob
 import math
@@ -296,7 +297,7 @@ class HighResInpaintingDataset(Dataset):
         return img, mask
 
 def train_weights():
-    TOTAL_EPOCHS = 1000
+    TOTAL_EPOCHS = 800
     accumulation_steps = 4
     START_EPOCH = 0
 
@@ -377,9 +378,13 @@ def train_weights():
         print("Model has completed the required number of epochs.")
         return
 
-    scheduler = CosineAnnealingLR(optimizer,
-                                  T_max=epochs_left * (len(dataloader) // accumulation_steps),
-                                  eta_min=1e-6)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
+
+    if is_resuming and os.path.exists(checkpoint_path) and 'scheduler_state_dict' in checkpoint:
+        try:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        except Exception:
+            print("Notice: Starting with fresh Scheduler (switched to ReduceLROnPlateau).")
 
     model.train()
     if is_resuming:
@@ -427,21 +432,24 @@ def train_weights():
 
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
                 scaler.unscale_(optimizer)
+
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                
                 optimizer.zero_grad(set_to_none=True)
 
             display_loss = total_loss.item() * accumulation_steps
             epoch_loss += display_loss
 
-            current_display_lr = scheduler.get_last_lr()[0]
-            progress_bar.set_postfix({'loss': f"{display_loss:.4f}", 'lr': f"{current_display_lr:.6f}"})
+            current_display_lr = optimizer.param_groups[0]['lr']
+            progress_bar.set_postfix({'loss': f"{display_loss:.4f}", 'lr': f"{current_display_lr:.6e}"})
 
         avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch {epoch}/{TOTAL_EPOCHS} completed - Average Loss: {avg_loss:.4f}")
+        print(f"\nEpoch {epoch}/{TOTAL_EPOCHS} completed - Average Loss: {avg_loss:.4f}")
+
+        scheduler.step(avg_loss)
 
         checkpoint_data = {
             'epoch': epoch,
