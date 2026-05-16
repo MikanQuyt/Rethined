@@ -1,4 +1,3 @@
-from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingLR, ReduceLROnPlateau
 import os
 import glob
 import math
@@ -16,7 +15,7 @@ from PIL import Image
 from einops import rearrange
 from kornia.filters import GaussianBlur2d
 from mobileone import MobileOne, mobileone
-from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 import torch._dynamo
 
@@ -45,6 +44,7 @@ class MultiHeadAttention(nn.Module):
         attn = torch.matmul(q / self.d_k**0.5, k.transpose(2, 3))
         if qk_mask is not None:
             attn += qk_mask
+        attn = torch.clamp(attn, min=-50.0, max=50.0)
         attn = F.softmax(attn, dim=-1)
         if self.use_argmax:
             idx =  torch.argmax(attn, dim=1, keepdims=True)
@@ -266,7 +266,8 @@ class HighResInpaintingDataset(Dataset):
 
         for img_dir in image_dirs:
             for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
-                self.image_paths.extend(glob.glob(os.path.join(img_dir, ext)))
+                search_path = os.path.join(img_dir, '**', ext)
+                self.image_paths.extend(glob.glob(search_path, recursive=True))
 
         if len(self.image_paths) == 0:
             raise RuntimeError(f"Error: Directory is empty or does not exist -> {image_dirs}")
@@ -298,11 +299,11 @@ class HighResInpaintingDataset(Dataset):
 
 def train_weights():
     TOTAL_EPOCHS = 800
-    accumulation_steps = 4
+    accumulation_steps = 2
     START_EPOCH = 0
 
-    checkpoint_path = "/content/rethined_checkpoint.pth"
-    best_checkpoint_path = "/content/rethined_checkpoint_best.pth"
+    local_checkpoint_path = "/content/rethined_checkpoint.pth"
+    local_best_checkpoint_path = "/content/rethined_checkpoint_best.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -312,7 +313,7 @@ def train_weights():
     ]
 
     dataset = HighResInpaintingDataset(image_dirs)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=2, pin_memory=True, prefetch_factor=2)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=2, pin_memory=True, prefetch_factor=2)
 
     config = {
         'coarse_model': {'class': 'MobileOneCoarse', 'parameters': {'variant': 's4'}},
@@ -333,18 +334,22 @@ def train_weights():
 
     is_resuming = False
 
-    if os.path.exists(checkpoint_path):
-        print("Found complete checkpoint locally. Restoring automatically.")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+    if os.path.exists(local_checkpoint_path):
+        print("Found checkpoint locally. Restoring automatically.")
+        checkpoint = torch.load(local_checkpoint_path, map_location=device)
 
-        state_dict = checkpoint['model_state_dict']
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            START_EPOCH = checkpoint.get('epoch', 0) + 1
+            print(f"Resuming training from Epoch {START_EPOCH}")
+        else:
+            state_dict = checkpoint
+            print("Notice: Loaded a raw weights file. Starting epoch count from 0.")
+
         new_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         model.load_state_dict(new_state_dict)
 
-        START_EPOCH = checkpoint['epoch']
         is_resuming = True
-        print(f"Resuming training from Epoch {START_EPOCH + 1}")
-        print(f"Retraining Epoch {START_EPOCH} to gain momentum and ensure training parameters.")
     else:
         print("No previous data found locally. Starting training from scratch (Epoch 0).")
 
@@ -352,39 +357,44 @@ def train_weights():
         param.requires_grad = True
     model.train()
 
-    current_lr = 1e-4
+    current_lr = 5e-5
 
-    torch._dynamo.config.suppress_errors = True
-    try:
-        model = torch.compile(model)
-    except Exception:
-        pass
+   #torch._dynamo.config.suppress_errors = True
+    #try:
+       # model = torch.compile(model)
+   # except Exception:
+      #  pass
+
 
     optimizer = AdamW(model.parameters(), lr=current_lr, weight_decay=1e-5)
 
-    if is_resuming and os.path.exists(checkpoint_path):
+    if is_resuming and os.path.exists(local_checkpoint_path):
         try:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"Successfully restored 100 percent of parameters from Epoch {START_EPOCH}.")
+            if isinstance(checkpoint, dict) and 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print(f"Successfully restored optimiser parameters from Epoch {START_EPOCH - 1}.")
         except Exception as e:
             print(f"Warning: Could not load optimiser ({e}). Reinitialising.")
 
     l1_loss_fn = torch.nn.L1Loss()
     perceptual_loss_fn = VGGPerceptualLoss().to(device)
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler('cuda', init_scale=1024.0)
 
     epochs_left = TOTAL_EPOCHS - START_EPOCH
     if epochs_left <= 0:
         print("Model has completed the required number of epochs.")
         return
 
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs_left, eta_min=1e-7)
 
-    if is_resuming and os.path.exists(checkpoint_path) and 'scheduler_state_dict' in checkpoint:
+    if is_resuming and os.path.exists(local_checkpoint_path):
         try:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        except Exception:
-            print("Notice: Starting with fresh Scheduler (switched to ReduceLROnPlateau).")
+            if isinstance(checkpoint, dict) and 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if isinstance(checkpoint, dict) and 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        except Exception as e:
+            print(f"Warning: Could not load scheduler or scaler ({e}).")
 
     model.train()
     if is_resuming:
@@ -392,13 +402,15 @@ def train_weights():
 
     best_loss = float('inf')
 
-    if is_resuming and os.path.exists(checkpoint_path):
-        if 'best_loss' in checkpoint:
+    if is_resuming and os.path.exists(local_checkpoint_path):
+        if isinstance(checkpoint, dict) and 'best_loss' in checkpoint:
             best_loss = checkpoint['best_loss']
             print(f"Previous Best Loss: {best_loss:.4f}")
 
     for epoch in range(START_EPOCH, TOTAL_EPOCHS):
         epoch_loss = 0.0
+        nan_count = 0
+        
         progress_bar = tqdm(enumerate(dataloader),
                             total=len(dataloader),
                             desc=f"Epoch {epoch}/{TOTAL_EPOCHS}")
@@ -420,24 +432,34 @@ def train_weights():
                 loss_l1_lr = l1_loss_fn(lr_out, lr_img)
                 loss_l1_hr = l1_loss_fn(hr_out, hr_img)
 
-                hr_out_for_vgg = F.interpolate(hr_out, size=1024, mode='bilinear')
-                hr_img_for_vgg = F.interpolate(hr_img, size=1024, mode='bilinear')
+                hr_out_for_vgg = F.interpolate(hr_out, size=512, mode='bilinear')
+                hr_img_for_vgg = F.interpolate(hr_img, size=512, mode='bilinear')
 
                 loss_perc_lr = perceptual_loss_fn(lr_out, lr_img)
                 loss_perc_hr = perceptual_loss_fn(hr_out_for_vgg, hr_img_for_vgg)
 
                 total_loss = (loss_l1_coarse + loss_l1_lr + loss_l1_hr + 0.1 * (loss_perc_lr + loss_perc_hr)) / accumulation_steps
 
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                nan_count += 1
+                if nan_count <= 3:
+                    print(f"\nWarning: Detected NaN/Inf Loss at Step {i}. Skipping to protect model.")
+                elif nan_count == 4:
+                    print(f"\nNotice: Multiple NaNs detected. Muting further warnings for this epoch.")
+                
+                optimizer.zero_grad(set_to_none=True)
+                
+                if nan_count > 20:
+                    raise ValueError("Model is severely corrupted with NaNs. Training halted to prevent overwriting healthy data. Please delete 'rethined_checkpoint.pth' and resume from 'rethined_checkpoint_best.pth'.")
+                continue
+
             scaler.scale(total_loss).backward()
 
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
                 scaler.unscale_(optimizer)
-
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
                 scaler.step(optimizer)
                 scaler.update()
-                
                 optimizer.zero_grad(set_to_none=True)
 
             display_loss = total_loss.item() * accumulation_steps
@@ -446,10 +468,13 @@ def train_weights():
             current_display_lr = optimizer.param_groups[0]['lr']
             progress_bar.set_postfix({'loss': f"{display_loss:.4f}", 'lr': f"{current_display_lr:.6e}"})
 
-        avg_loss = epoch_loss / len(dataloader)
+        if nan_count >= len(dataloader) * 0.9:
+            raise ValueError("Almost all steps returned NaN. The current checkpoint weights are corrupted.")
+
+        avg_loss = epoch_loss / max(1, (len(dataloader) - nan_count))
         print(f"\nEpoch {epoch}/{TOTAL_EPOCHS} completed - Average Loss: {avg_loss:.4f}")
 
-        scheduler.step(avg_loss)
+        scheduler.step()
 
         checkpoint_data = {
             'epoch': epoch,
@@ -460,20 +485,20 @@ def train_weights():
             'best_loss': best_loss
         }
 
-        temp_path = checkpoint_path + ".tmp"
-        torch.save(checkpoint_data, temp_path)
-        os.replace(temp_path, checkpoint_path)
-        print(f"Successfully saved checkpoint (Epoch {epoch}) locally.")
+        temp_local_path = local_checkpoint_path + ".tmp"
+        torch.save(checkpoint_data, temp_local_path)
+        os.replace(temp_local_path, local_checkpoint_path)
+        print(f"Successfully saved checkpoint for Epoch {epoch} to local storage.")
 
         if avg_loss < best_loss:
             print(f"New Record! Loss decreased from {best_loss:.4f} down to {avg_loss:.4f}")
             best_loss = avg_loss
 
-            temp_best_path = best_checkpoint_path + ".tmp"
+            temp_best_path = local_best_checkpoint_path + ".tmp"
             torch.save(model.state_dict(), temp_best_path)
-            os.replace(temp_best_path, best_checkpoint_path)
+            os.replace(temp_best_path, local_best_checkpoint_path)
 
-            print("Updated best checkpoint file locally.")
+            print("Safely updated best checkpoint file on local storage.")
 
 if __name__ == "__main__":
     train_weights()
