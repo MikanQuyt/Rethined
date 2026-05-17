@@ -13,11 +13,13 @@ import torchvision.transforms as T
 from torchvision.models import vgg16, VGG16_Weights
 from PIL import Image
 from einops import rearrange
-from kornia.filters import GaussianBlur2d
+#from kornia.filters import GaussianBlur2d
 from mobileone import MobileOne, mobileone
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 import torch._dynamo
+from torch.nn.attention import sdpa_kernel, SDPBackend
+import torchvision.transforms.functional as TF
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, d_v, n_head, split, dropout, d_qk, compute_v, use_argmax=False):
@@ -42,10 +44,19 @@ class MultiHeadAttention(nn.Module):
         v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         attn = torch.matmul(q / self.d_k**0.5, k.transpose(2, 3))
+        
         if qk_mask is not None:
             attn += qk_mask
+            
         attn = torch.clamp(attn, min=-50.0, max=50.0)
         attn = F.softmax(attn, dim=-1)
+        
+        if self.use_argmax:
+            idx = torch.argmax(attn, dim=1, keepdims=True)
+            attn = torch.zeros_like(attn).scatter_(1, idx, 1.)
+            
+        attn_dropped = self.dropout(attn)
+
         if self.use_argmax:
             idx =  torch.argmax(attn, dim=1, keepdims=True)
             attn = torch.zeros_like(attn).scatter_(1, idx, 1.)
@@ -72,7 +83,7 @@ class PatchInpainting(nn.Module):
         self.mask_inpainting = mask_inpainting
         self.use_argmax = use_argmax
         super().__init__()
-        self.final_gaussian_blur = GaussianBlur2d((7,7),sigma=(2.01, 2.01),separable=False)
+        #self.final_gaussian_blur = GaussianBlur2d((7,7),sigma=(2.01, 2.01),separable=False)
         self.pooling_layer = nn.MaxPool2d(kernel_size, stride=kernel_size)
         self.multihead_attention = MultiHeadAttention(embed_dim=stem_out_channels*kernel_size*kernel_size + self.feature_dim if self.concat_features else stem_out_channels*kernel_size*kernel_size, d_v=stem_out_channels*kernel_size*kernel_size, n_head=self.nheads, split=True, dropout=dropout, d_qk=embed_dim, compute_v=compute_v, use_argmax=self.use_argmax)
         self.stem_out_channels = stem_out_channels
@@ -117,7 +128,8 @@ class PatchInpainting(nn.Module):
         else:
             image = image_coarse_inpainting
         image_to_return = image_coarse_inpainting
-        image_blurred = self.final_gaussian_blur(image)
+        #image_blurred = self.final_gaussian_blur(image)
+        image_blurred = TF.gaussian_blur(image, kernel_size=[7, 7], sigma=[2.01, 2.01])
         image_as_patches_blurred, _ = self.unfolding_coreml(image_blurred, self.unfolding_weights, self.kernel_size)
         image_as_patches, sizes = self.unfolding_coreml(image, self.unfolding_weights, self.kernel_size)
         image_as_patches = image_as_patches - image_as_patches_blurred
@@ -216,7 +228,8 @@ class AttentionUpscaling(nn.Module):
         hr_patch_size = self.patch_inpainting.kernel_size * (hr_h // lr_h)
         unfolding_weights_hr = self.patch_inpainting._compute_unfolding_weights(kernel_size=hr_patch_size, channels=x_hr.shape[1]).to(x_hr.device)
         hr_patches, _ = self.patch_inpainting.unfolding_coreml(x_hr, unfolding_weights_hr, hr_patch_size)
-        hr_blurred = self.patch_inpainting.final_gaussian_blur(x_hr)
+        #hr_blurred = self.patch_inpainting.final_gaussian_blur(x_hr)
+        hr_blurred = TF.gaussian_blur(x_hr, kernel_size=[7, 7], sigma=[2.01, 2.01])
         hr_patches_blurred, _ = self.patch_inpainting.unfolding_coreml(hr_blurred, unfolding_weights_hr, hr_patch_size)
         hr_hf_patches = hr_patches - hr_patches_blurred
         hr_hf_patches = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
@@ -298,8 +311,8 @@ class HighResInpaintingDataset(Dataset):
         return img, mask
 
 def train_weights():
-    TOTAL_EPOCHS = 800
-    accumulation_steps = 2
+    TOTAL_EPOCHS = 1600
+    accumulation_steps = 4
     START_EPOCH = 0
 
     local_checkpoint_path = "/content/rethined_checkpoint.pth"
@@ -309,11 +322,15 @@ def train_weights():
 
     image_dirs = [
         "/content/rethined/datasets/DF8K-Inpainting/masks/test/cafhq/",
-        "/content/rethined/datasets/DF8K-Inpainting/masks/test/div2k/"
+        "/content/rethined/datasets/DF8K-Inpainting/masks/test/div2k/",
+        "/content/rethined/datasets/DF2K",
+        "/content/rethined/datasets/CAF/images"
+
+
     ]
 
     dataset = HighResInpaintingDataset(image_dirs)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=2, pin_memory=True, prefetch_factor=2)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=2, pin_memory=True, prefetch_factor=4)
 
     config = {
         'coarse_model': {'class': 'MobileOneCoarse', 'parameters': {'variant': 's4'}},
@@ -357,13 +374,13 @@ def train_weights():
         param.requires_grad = True
     model.train()
 
-    current_lr = 5e-5
+    current_lr = 5e-4
 
-   #torch._dynamo.config.suppress_errors = True
-    #try:
-       # model = torch.compile(model)
-   # except Exception:
-      #  pass
+    torch._dynamo.config.suppress_errors = True
+    try:
+        model = torch.compile(model, backend = "inductor", options = {"triton.cudagraphs"})
+    except Exception:
+        print(f"Compile Info:{e}")
 
 
     optimizer = AdamW(model.parameters(), lr=current_lr, weight_decay=1e-5)
@@ -410,7 +427,7 @@ def train_weights():
     for epoch in range(START_EPOCH, TOTAL_EPOCHS):
         epoch_loss = 0.0
         nan_count = 0
-        
+
         progress_bar = tqdm(enumerate(dataloader),
                             total=len(dataloader),
                             desc=f"Epoch {epoch}/{TOTAL_EPOCHS}")
@@ -418,9 +435,10 @@ def train_weights():
         optimizer.zero_grad(set_to_none=True)
 
         for i, (hr_img, hr_mask) in progress_bar:
+            torch.compiler.cudagraph_mark_step_begin()
             hr_img, hr_mask = hr_img.to(device, non_blocking=True), hr_mask.to(device, non_blocking=True)
 
-            lr_img = F.interpolate(hr_img, size=512, mode='bicubic', antialias=True)
+            lr_img = F.interpolate(hr_img, size=512, mode='bilinear', antialias=True)
             lr_mask = F.interpolate(hr_mask, size=512)
             masked_lr_img = lr_img * (1 - lr_mask)
 
@@ -446,9 +464,9 @@ def train_weights():
                     print(f"\nWarning: Detected NaN/Inf Loss at Step {i}. Skipping to protect model.")
                 elif nan_count == 4:
                     print(f"\nNotice: Multiple NaNs detected. Muting further warnings for this epoch.")
-                
+
                 optimizer.zero_grad(set_to_none=True)
-                
+
                 if nan_count > 20:
                     raise ValueError("Model is severely corrupted with NaNs. Training halted to prevent overwriting healthy data. Please delete 'rethined_checkpoint.pth' and resume from 'rethined_checkpoint_best.pth'.")
                 continue
