@@ -544,7 +544,7 @@ def train_weights():
         os.replace(temp_local_path, local_checkpoint_path)
 
         if avg_test_loss < best_loss:
-            print(f"★ NEW RECORD! Test Loss decreased from {best_loss:.4f} down to {avg_test_loss:.4f}")
+            print(f"Test Loss decreased from {best_loss:.4f} down to {avg_test_loss:.4f}")
             best_loss = avg_test_loss
             
             checkpoint_data['best_loss'] = best_loss
