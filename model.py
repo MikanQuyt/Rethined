@@ -1,20 +1,18 @@
 import os
 import glob
-import math
+import random
 import cv2
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-import torchvision
-from torchvision.utils import save_image
 import torchvision.transforms as T
-from einops import rearrange
+import torchvision.transforms.functional as TF
+from torchvision.utils import save_image
 import matplotlib.pyplot as plt
 from PIL import Image
-from kornia.filters import GaussianBlur2d
+from einops import rearrange
 from mobileone import MobileOne, mobileone
-import random
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, d_v, n_head, split, dropout, d_qk, compute_v, use_argmax=False):
@@ -33,20 +31,26 @@ class MultiHeadAttention(nn.Module):
     def forward(self, q, k, v, qpos, kpos, qk_mask=None, k_mask=None):
         d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
         sz_b, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
-        residual = v
+        
         q = self.w_qs(q).view(sz_b, len_q, n_head, d_k)
         k = self.w_ks(k).view(sz_b, len_k, n_head, d_k)
         v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        
         attn = torch.matmul(q / self.d_k**0.5, k.transpose(2, 3))
         if qk_mask is not None:
             attn += qk_mask
+            
+        attn = torch.clamp(attn, min=-50.0, max=50.0)
         attn = F.softmax(attn, dim=-1)
+        
         if self.use_argmax:
-            idx =  torch.argmax(attn, dim=1, keepdims=True)
+            idx = torch.argmax(attn, dim=1, keepdims=True)
             attn = torch.zeros_like(attn).scatter_(1, idx, 1.)
-        attn = self.dropout(attn)
-        output = torch.matmul(attn, v)
+            
+        attn_dropped = self.dropout(attn)
+        
+        output = torch.matmul(attn_dropped, v)
         output = output.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
         output = self.dropout(self.fc(output))
         return output, attn
@@ -68,21 +72,25 @@ class PatchInpainting(nn.Module):
         self.mask_inpainting = mask_inpainting
         self.use_argmax = use_argmax
         super().__init__()
-        self.final_gaussian_blur = GaussianBlur2d((7,7),sigma=(2.01, 2.01),separable=False)
+        
         self.pooling_layer = nn.MaxPool2d(kernel_size, stride=kernel_size)
         self.multihead_attention = MultiHeadAttention(embed_dim=stem_out_channels*kernel_size*kernel_size + self.feature_dim if self.concat_features else stem_out_channels*kernel_size*kernel_size, d_v=stem_out_channels*kernel_size*kernel_size, n_head=self.nheads, split=True, dropout=dropout, d_qk=embed_dim, compute_v=compute_v, use_argmax=self.use_argmax)
         self.stem_out_channels = stem_out_channels
         self.stem_out_stride = stem_out_stride
         self.register_buffer('qk_mask', 1e4 * torch.eye(int((image_size / stem_out_stride/self.kernel_size)**2)).unsqueeze(0).unsqueeze(0))
+        
         if not mask_query_with_segmentation_mask:
             self.mask_query = torch.nn.Parameter(torch.zeros(1, int((image_size/stem_out_stride/self.kernel_size)**2), 1, 1).float())
+            
         self.encoder_decoder = model
         self.image_size = image_size
         self.positionalencoding = torch.nn.Parameter(torch.zeros(1, self.kernel_size**2*stem_out_channels + self.feature_dim, int((image_size/stem_out_stride/self.kernel_size)**2))) if use_kpos or use_qpos else None
         self.final_conv = torch.nn.Sequential(nn.Conv2d(stem_out_channels*kernel_size*kernel_size, stem_out_channels*kernel_size*kernel_size, kernel_size=3, stride=1, padding=1, padding_mode='reflect'), torch.nn.Sigmoid()) if self.final_conv else None
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
+        
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
+            
         self.register_buffer(name="unfolding_weights", tensor=self._compute_unfolding_weights(self.kernel_size, self.stem_out_channels), persistent=False)
         self.register_buffer(name="unfolding_weights_image", tensor=self._compute_unfolding_weights(self.kernel_size, 3), persistent=False)
         self.register_buffer(name="unfolding_weights_mask", tensor=self._compute_unfolding_weights(self.kernel_size, 1), persistent=False)
@@ -113,14 +121,17 @@ class PatchInpainting(nn.Module):
         else:
             image = image_coarse_inpainting
         image_to_return = image_coarse_inpainting
-        image_blurred = self.final_gaussian_blur(image)
+        
+        image_blurred = TF.gaussian_blur(image, kernel_size=[7, 7], sigma=[2.01, 2.01])
         image_as_patches_blurred, _ = self.unfolding_coreml(image_blurred, self.unfolding_weights, self.kernel_size)
         image_as_patches, sizes = self.unfolding_coreml(image, self.unfolding_weights, self.kernel_size)
         image_as_patches = image_as_patches - image_as_patches_blurred
+        
         pos = self.positionalencoding.repeat(image_as_patches.size(0), 1, 1).unsqueeze(2) if self.use_qpos else None
         mask_same_res_as_features_pooled, _ = self.unfolding_coreml(mask, self.unfolding_weights_mask, self.kernel_size)
         mask_same_res_as_features_pooled = mask_same_res_as_features_pooled[:, 0:1, :, :]
         mask_same_res_as_features_pooled = mask_same_res_as_features_pooled.flatten(start_dim=2).unsqueeze(-1)
+        
         if self.concat_features:
             features_to_concat = features[self.feature_i]
             features_to_concat = F.interpolate(features_to_concat, size=image_as_patches.shape[-2:], mode='bilinear', align_corners=False)
@@ -128,9 +139,11 @@ class PatchInpainting(nn.Module):
             input_attn = input_attn.flatten(start_dim=2).transpose(1, 2)
         else:
             input_attn = image_as_patches.flatten(start_dim=2).transpose(1, 2)
+            
         image_as_patches = image_as_patches.flatten(start_dim=2).transpose(1, 2)
         qk_mask = -1e4*self.qk_mask.repeat(image_as_patches.size(0), 1, 1, 1) + 2e4*((1 - mask_same_res_as_features_pooled)*self.qk_mask) if self.attention_masking else None
         k_mask  = -1e4*mask_same_res_as_features_pooled if self.attention_masking else None
+        
         out, atten_weights = self.multihead_attention(input_attn, input_attn, image_as_patches, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask)
         out = out - image_as_patches_blurred.flatten(start_dim=2).transpose(1, 2)
         mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
@@ -208,14 +221,16 @@ class AttentionUpscaling(nn.Module):
     def forward(self, x_hr, x_lr_inpainted, attn_map):
         hr_h, hr_w = x_hr.shape[-2:]
         lr_h, lr_w = x_lr_inpainted.shape[-2:]
-        x_hr_base = F.interpolate(x_lr_inpainted, size=(hr_h, hr_w), mode='bicubic', align_corners=False)
+        x_hr_base = F.interpolate(x_lr_inpainted, size=(hr_h, hr_w), mode='bilinear', align_corners=False)
         hr_patch_size = self.patch_inpainting.kernel_size * (hr_h // lr_h)
         unfolding_weights_hr = self.patch_inpainting._compute_unfolding_weights(kernel_size=hr_patch_size, channels=x_hr.shape[1]).to(x_hr.device)
         hr_patches, _ = self.patch_inpainting.unfolding_coreml(x_hr, unfolding_weights_hr, hr_patch_size)
-        hr_blurred = self.patch_inpainting.final_gaussian_blur(x_hr)
+        
+        hr_blurred = TF.gaussian_blur(x_hr, kernel_size=[7, 7], sigma=[2.01, 2.01])
         hr_patches_blurred, _ = self.patch_inpainting.unfolding_coreml(hr_blurred, unfolding_weights_hr, hr_patch_size)
         hr_hf_patches = hr_patches - hr_patches_blurred
         hr_hf_patches = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
+        
         reconstructed_hr_hf_patches = torch.matmul(attn_map.squeeze(1), hr_hf_patches)
         reconstructed_hr_hf_image = self.patch_inpainting.folding_coreml(reconstructed_hr_hf_patches, (hr_h, hr_w), kernel_size=hr_patch_size, use_final_conv=False)
         final_hr_image = x_hr_base + reconstructed_hr_hf_image
@@ -237,9 +252,7 @@ def test_inference():
     config = {
         'coarse_model': {
             'class': 'MobileOneCoarse',
-            'parameters': {
-                'variant': 's4'
-            }
+            'parameters': {'variant': 's4'}
         },
         'generator': {
             'generator_class': 'PatchInpainting',
@@ -259,11 +272,14 @@ def test_inference():
     model = InpaintingModel(config).to(device)
     attention_upscaler = AttentionUpscaling(model.generator).to(device)
 
-    checkpoint_path = "/content/rethined_checkpoint.pth"
+    best_path = "/content/rethined_checkpoint_best.pth"
+    normal_path = "/content/rethined_checkpoint.pth"
+    checkpoint_path = best_path if os.path.exists(best_path) else normal_path
+
     if os.path.exists(checkpoint_path):
         print(f"Loading weights from: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        
+
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         new_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         model.load_state_dict(new_state_dict)
@@ -274,21 +290,20 @@ def test_inference():
     attention_upscaler.eval()
 
     image_dirs = [
-        "/content/rethined/datasets/DF8K-Inpainting/masks/test/div2k",
-        "/content/rethined/datasets/DF8K-Inpainting/masks/test/cafhq",
+        "/content/rethined/datasets/CAF/images",
     ]
-    
+
     all_images = []
     print("Scanning for images in directories...")
     for img_dir in image_dirs:
         if not os.path.exists(img_dir):
             print(f"  -> Skipping: Directory does not exist '{img_dir}'")
             continue
-            
+
         for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG'):
             found_imgs = glob.glob(os.path.join(img_dir, ext))
             all_images.extend(found_imgs)
-            
+
     if len(all_images) == 0:
         raise RuntimeError(f"Could not find any images in the provided directories: {image_dirs}")
 
@@ -310,24 +325,25 @@ def test_inference():
 
     _, _, h, w = high_res_image.shape
     high_res_mask = torch.zeros(1, 1, h, w).to(device)
-    
+
     center_y = h // 2 + random.randint(-100, 100)
     center_x = w // 2 + random.randint(-100, 100)
     mask_size = random.randint(150, 250)
-    
+
     y1, y2 = max(0, center_y - mask_size), min(h, center_y + mask_size)
     x1, x2 = max(0, center_x - mask_size), min(w, center_x + mask_size)
     high_res_mask[:, :, y1:y2, x1:x2] = 1
 
-    low_res_image = F.interpolate(high_res_image, size=512, mode='bicubic', antialias=True)
+    low_res_image = F.interpolate(high_res_image, size=512, mode='bilinear', antialias=True)
     low_res_mask = F.interpolate(high_res_mask, size=512)
     masked_low_res_image = low_res_image * (1 - low_res_mask)
     masked_high_res_image = high_res_image * (1 - high_res_mask)
 
     print("Running restoration network...")
     with torch.no_grad():
-        output, attn_scores, temp_image = model(masked_low_res_image, low_res_mask)
-        final_output = attention_upscaler(high_res_image, output, attn_scores)
+        with torch.amp.autocast('cuda'):
+            output, attn_scores, temp_image = model(masked_low_res_image, low_res_mask)
+            final_output = attention_upscaler(high_res_image, output, attn_scores)
 
         final_output = final_output * high_res_mask + high_res_image * (1 - high_res_mask)
 
